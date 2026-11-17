@@ -1,7 +1,8 @@
 import express from "express";
 import {
   placeOrder,
-  placeOrderEsewa,
+  initiateEsewaPayment,
+  verifyEsewaPayment,
   initiateKhaltiPayment,
   verifyKhaltiPayment,
   userOrders,
@@ -23,7 +24,8 @@ orderRouter.delete("/remove/:id", adminAuth, deleteOrder);
 orderRouter.post("/place", authUser, placeOrder);
 orderRouter.post("/khalti/initiate", authUser, initiateKhaltiPayment);
 orderRouter.post("/khalti/verify", authUser, verifyKhaltiPayment);
-orderRouter.post("/esewa", authUser, placeOrderEsewa);
+orderRouter.post("/esewa/initiate", authUser, initiateEsewaPayment);
+orderRouter.post("/esewa/verify", authUser, verifyEsewaPayment);
 
 //user feature
 orderRouter.post("/userorders", authUser, userOrders);

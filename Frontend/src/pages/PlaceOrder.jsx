@@ -1,4 +1,4 @@
-import React, { useContext, useState } from "react";
+import { useContext, useState } from "react";
 import Title from "../components/Title";
 import CartTotal from "../components/CartTotal";
 import esewa from "../assets/esewa.jpg";
@@ -90,13 +90,51 @@ const PlaceOrder = () => {
         },
       };
 
+      if (method === "esewa") {
+        const response = await axios.post(
+          `${backendUrl}/api/order/esewa/initiate`,
+          { items: orderData.items, address: formData },
+          { ...authHeaders, validateStatus: () => true }
+        );
+
+        if (
+          response.data.success &&
+          response.data.payment_url &&
+          response.data.payment
+        ) {
+          const paymentForm = document.createElement("form");
+          paymentForm.method = "POST";
+          paymentForm.action = response.data.payment_url;
+          Object.entries(response.data.payment).forEach(([name, value]) => {
+            const input = document.createElement("input");
+            input.type = "hidden";
+            input.name = name;
+            input.value = String(value);
+            paymentForm.appendChild(input);
+          });
+          document.body.appendChild(paymentForm);
+          paymentForm.submit();
+          return;
+        }
+
+        toast.error(
+          response.data.message ||
+            `Could not start eSewa payment (${response.status}).`
+        );
+        setLoading(false);
+        return;
+      }
+
       // Khalti: server initiates ePayment, then user pays on Khalti (sandbox / production).
       // Docs: https://docs.khalti.com/khalti-epayment/
       if (method === "khalti") {
-        const { paymentMethod: _pm, ...payload } = orderData;
         const response = await axios.post(
           `${backendUrl}/api/order/khalti/initiate`,
-          { ...payload, paymentMethod: "Khalti" },
+          {
+            items: orderData.items,
+            address: formData,
+            paymentMethod: "Khalti",
+          },
           { ...authHeaders, validateStatus: () => true }
         );
 

@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
 import orderModel from "../models/orderModel.js";
 import userModel from "../models/userModel.js";
 import productModel from "../models/productModel.js";
@@ -38,35 +39,304 @@ export const placeOrder = async (req, res) => {
   }
 };
 
-// Esewa payment
-export const placeOrderEsewa = async (req, res) => {
+const ESEWA_DELIVERY_FEE = 100;
+const ESEWA_SIGNED_FIELDS =
+  "transaction_code,status,total_amount,transaction_uuid,product_code,signed_field_names";
+
+const getEsewaConfig = () => ({
+  secret: String(process.env.ESEWA_SECRET_KEY || "").trim(),
+  productCode: String(process.env.ESEWA_PRODUCT_CODE || "").trim(),
+  gatewayUrl: (
+    process.env.ESEWA_GATEWAY_URL || "https://rc-epay.esewa.com.np"
+  ).replace(/\/$/, ""),
+});
+
+const signEsewaFields = (fields, secret) =>
+  createHmac("sha256", secret).update(fields).digest("base64");
+
+const toEsewaPaisa = (amount) => Math.round(Number(amount) * 100);
+
+export const initiateEsewaPayment = async (req, res) => {
   try {
     const userId = req.userId;
-    const { items, amount, address, paymentDetails } = req.body;
+    const { items, address } = req.body;
+    const { secret, productCode, gatewayUrl } = getEsewaConfig();
 
-    if (!items || items.length === 0) {
-      return res.json({ success: false, message: "No items in the order" });
+    if (!secret || !productCode) {
+      return res.status(500).json({
+        success: false,
+        message:
+          "Configure ESEWA_SECRET_KEY and ESEWA_PRODUCT_CODE in Backend/.env.",
+      });
     }
 
-    const orderData = {
+    if (
+      !Array.isArray(items) ||
+      items.length === 0 ||
+      items.some(
+        (item) =>
+          !item ||
+          !/^[a-f\d]{24}$/i.test(String(item._id)) ||
+          !Number.isSafeInteger(Number(item.quantity)) ||
+          Number(item.quantity) < 1
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Order must contain valid product IDs and quantities.",
+      });
+    }
+
+    const productIds = items.map((item) => String(item._id));
+    if (new Set(productIds).size !== productIds.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Order contains duplicate products.",
+      });
+    }
+
+    const products = await productModel
+      .find({ _id: { $in: productIds } })
+      .select("name price image")
+      .lean();
+    if (products.length !== productIds.length) {
+      return res.status(400).json({
+        success: false,
+        message: "One or more products are no longer available.",
+      });
+    }
+
+    const productsById = new Map(
+      products.map((product) => [String(product._id), product])
+    );
+    const orderItems = items.map((item) => {
+      const product = productsById.get(String(item._id));
+      return {
+        _id: String(product._id),
+        name: product.name,
+        price: product.price,
+        image: product.image,
+        quantity: Number(item.quantity),
+      };
+    });
+
+    const itemsAmountPaisa = orderItems.reduce(
+      (total, item) => total + toEsewaPaisa(item.price) * item.quantity,
+      0
+    );
+    const totalAmountPaisa =
+      itemsAmountPaisa + toEsewaPaisa(ESEWA_DELIVERY_FEE);
+    if (
+      !Number.isSafeInteger(totalAmountPaisa) ||
+      totalAmountPaisa <= 0 ||
+      orderItems.some((item) => !Number.isSafeInteger(toEsewaPaisa(item.price)))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "The order amount is invalid.",
+      });
+    }
+
+    const frontendUrl = (
+      process.env.FRONTEND_URL || "http://localhost:5173"
+    ).replace(/\/$/, "");
+    const totalAmount = (totalAmountPaisa / 100).toFixed(2);
+    const order = await orderModel.create({
       userId,
-      items,
-      amount,
+      items: orderItems,
+      amount: Number(totalAmount),
       address,
       paymentMethod: "Esewa",
-      payment: true,
-      paymentDetails,
-      status: "completed",
+      payment: false,
+      status: "Esewa Pending",
       date: Date.now(),
+    });
+
+    const transactionUuid = order._id.toString();
+    const signedFields = `total_amount=${totalAmount},transaction_uuid=${transactionUuid},product_code=${productCode}`;
+    const payment = {
+      amount: (itemsAmountPaisa / 100).toFixed(2),
+      tax_amount: "0",
+      total_amount: totalAmount,
+      transaction_uuid: transactionUuid,
+      product_code: productCode,
+      product_service_charge: "0",
+      product_delivery_charge: ESEWA_DELIVERY_FEE.toFixed(2),
+      success_url: new URL("/payment/esewa-return", frontendUrl).toString(),
+      failure_url: new URL(
+        "/payment/esewa-return?status=failed",
+        frontendUrl
+      ).toString(),
+      signed_field_names: "total_amount,transaction_uuid,product_code",
+      signature: signEsewaFields(signedFields, secret),
     };
 
-    const newOrder = await orderModel.create(orderData);
-    await userModel.findByIdAndUpdate(userId, { cartData: {} });
-
-    res.json({ success: true, message: "Order placed via Esewa", order: newOrder });
+    return res.json({
+      success: true,
+      payment_url: `${gatewayUrl}/api/epay/main/v2/form`,
+      payment,
+      orderId: transactionUuid,
+    });
   } catch (error) {
     console.log(error);
-    res.json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const verifyEsewaPayment = async (req, res) => {
+  try {
+    const userId = String(req.userId);
+    const { data } = req.body;
+    const { secret, productCode, gatewayUrl } = getEsewaConfig();
+    if (!secret || !productCode) {
+      return res.status(500).json({
+        success: false,
+        message:
+          "Configure ESEWA_SECRET_KEY and ESEWA_PRODUCT_CODE in Backend/.env.",
+      });
+    }
+    if (typeof data !== "string" || !data) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing eSewa payment response.",
+      });
+    }
+
+    let decoded;
+    try {
+      decoded = JSON.parse(Buffer.from(data, "base64").toString("utf8"));
+    } catch {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid eSewa payment response.",
+      });
+    }
+
+    const signedFieldNames = decoded.signed_field_names;
+    const signedFields =
+      typeof signedFieldNames === "string" ? signedFieldNames.split(",") : [];
+    if (
+      signedFieldNames !== ESEWA_SIGNED_FIELDS ||
+      signedFields.some((field) => typeof decoded[field] !== "string") ||
+      typeof decoded.signature !== "string" ||
+      decoded.product_code !== productCode ||
+      decoded.status !== "COMPLETE" ||
+      !/^[a-f\d]{24}$/i.test(String(decoded.transaction_uuid))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or incomplete eSewa payment response.",
+      });
+    }
+
+    const signedData = signedFields
+      .map((field) => `${field}=${decoded[field]}`)
+      .join(",");
+    const expectedSignature = signEsewaFields(signedData, secret);
+    const receivedSignature = Buffer.from(decoded.signature);
+    const expectedSignatureBuffer = Buffer.from(expectedSignature);
+    if (
+      receivedSignature.length !== expectedSignatureBuffer.length ||
+      !timingSafeEqual(receivedSignature, expectedSignatureBuffer)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "eSewa response signature is invalid.",
+      });
+    }
+
+    const order = await orderModel.findById(decoded.transaction_uuid);
+    if (
+      !order ||
+      String(order.userId) !== userId ||
+      order.paymentMethod !== "Esewa"
+    ) {
+      return res.status(404).json({ success: false, message: "Order not found." });
+    }
+
+    const expectedAmountPaisa = toEsewaPaisa(order.amount);
+    if (toEsewaPaisa(decoded.total_amount) !== expectedAmountPaisa) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment amount does not match the order.",
+      });
+    }
+
+    if (order.payment) {
+      return res.json({
+        success: true,
+        message: "Order already confirmed.",
+        order,
+      });
+    }
+
+    const statusUrl = new URL(
+      "/api/epay/transaction/status/",
+      `${gatewayUrl}/`
+    );
+    statusUrl.search = new URLSearchParams({
+      product_code: productCode,
+      total_amount: (expectedAmountPaisa / 100).toFixed(2),
+      transaction_uuid: order._id.toString(),
+    }).toString();
+
+    const statusResponse = await fetch(statusUrl, {
+      headers: { Accept: "application/json" },
+    });
+    const statusText = await statusResponse.text();
+    let paymentStatus;
+    try {
+      paymentStatus = statusText ? JSON.parse(statusText) : {};
+    } catch {
+      return res.status(502).json({
+        success: false,
+        message: "Invalid response from eSewa transaction verification.",
+      });
+    }
+
+    if (!statusResponse.ok) {
+      return res.status(502).json({
+        success: false,
+        message:
+          paymentStatus.message || "Could not verify the payment with eSewa.",
+      });
+    }
+
+    if (
+      paymentStatus.status !== "COMPLETE" ||
+      paymentStatus.transaction_uuid !== order._id.toString() ||
+      paymentStatus.product_code !== productCode ||
+      toEsewaPaisa(paymentStatus.total_amount) !== expectedAmountPaisa
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: paymentStatus.status || "eSewa payment is not complete.",
+      });
+    }
+
+    await orderModel.findByIdAndUpdate(order._id, {
+      payment: true,
+      status: "OrderPlaced",
+      paymentDetails: {
+        transaction_code: decoded.transaction_code,
+        status: paymentStatus.status,
+        total_amount: paymentStatus.total_amount,
+        transaction_uuid: order._id.toString(),
+        product_code: productCode,
+        ref_id: paymentStatus.ref_id,
+      },
+    });
+    await userModel.findByIdAndUpdate(userId, { cartData: {} });
+
+    const updatedOrder = await orderModel.findById(order._id);
+    return res.json({
+      success: true,
+      message: "Payment verified.",
+      order: updatedOrder,
+    });
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
